@@ -97,8 +97,10 @@ int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count =
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, fusion_pub_en = false;
 bool    is_first_lidar = true;
+
+int FusionBufferSize = 3;
 
 string odom_frame_id, base_frame_id;
 
@@ -110,6 +112,10 @@ vector<double>       extrinR(9, 0.0);
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
+
+deque<PointCloudXYZI::Ptr> FusionLaserPointBuffer;
+ 
+int FusionbufferIndex = 0;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -451,8 +457,36 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull,rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubFusionLaserCloud )
+PointCloudXYZI::Ptr pcl_fusion_sum(new PointCloudXYZI());
+
+void publishFusionLaserCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubFusionLaserCloud ) {
+    
+    int size = feats_undistort->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld( \
+                        new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++)
+        {
+            RGBpointBodyToWorld(&feats_undistort->points[i], \
+                                &laserCloudWorld->points[i]);
+        }
+        
+        FusionLaserPointBuffer.insert(FusionLaserPointBuffer.begin() + FusionbufferIndex, laserCloudWorld);
+        for(int i = 0; i < FusionBufferSize; i++) *pcl_fusion_sum += *FusionLaserPointBuffer.at(i);
+
+        FusionbufferIndex = (FusionbufferIndex + 1) % FusionBufferSize;
+        sensor_msgs::msg::PointCloud2 FusionlaserCloudmsg;
+        pcl::toROSMsg(*pcl_fusion_sum, FusionlaserCloudmsg);
+        FusionlaserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+        FusionlaserCloudmsg.header.frame_id = odom_frame_id;
+        pubFusionLaserCloud->publish(FusionlaserCloudmsg);
+        pcl_fusion_sum->clear();
+}
+
+
+
+void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
+    
     if(scan_pub_en)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
@@ -479,38 +513,32 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
     
-    if (pcd_save_en)
+        if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
         PointCloudXYZI::Ptr laserCloudWorld( \
                         new PointCloudXYZI(size, 1));
+
         for (int i = 0; i < size; i++)
         {
             RGBpointBodyToWorld(&feats_undistort->points[i], \
                                 &laserCloudWorld->points[i]);
         }
         *pcl_wait_save += *laserCloudWorld;
-    }
+
         static int scan_wait_num = 0;
         scan_wait_num ++;
         if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
         {
             pcd_index ++;
-            //string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-            //pcl::PCDWriter pcd_writer;
-            //cout << "current scan saved to /PCD/" << all_points_dir << endl;
-            // pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-            
-
-            sensor_msgs::msg::PointCloud2 FusionlaserCloudmsg;
-            pcl::toROSMsg(*pcl_wait_save, FusionlaserCloudmsg);
-            FusionlaserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-            FusionlaserCloudmsg.header.frame_id = odom_frame_id;
-            pubFusionLaserCloud->publish(FusionlaserCloudmsg);
-
-            scan_wait_num = 0;
+            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+            pcl::PCDWriter pcd_writer;
+            cout << "current scan saved to /PCD/" << all_points_dir << endl;
+            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
             pcl_wait_save->clear();
-        }  
+            scan_wait_num = 0;
+        }
+    }
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -816,6 +844,12 @@ public:
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+
+
+        this->declare_parameter<bool>("fusionCloud.fusion_pub_en", false);
+        this->declare_parameter<const int>("fusionCloud.interval", 5);
+
+
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
@@ -828,6 +862,7 @@ public:
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
+        this->get_parameter_or<bool>("publish.fusion_pub_en", fusion_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
@@ -854,6 +889,8 @@ public:
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
+        this->get_parameter_or<bool>("fusionCloud.fusion_pub_en",fusion_pub_en, false);
+        this->get_parameter_or<int>("fusionCloud.interval",FusionBufferSize, 5);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
@@ -927,6 +964,10 @@ public:
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+        // init fusion buffer
+        FusionLaserPointBuffer.resize(FusionBufferSize);
+        for (int i = 0; i < FusionBufferSize; i++) FusionLaserPointBuffer[i].reset(new PointCloudXYZI());
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1054,7 +1095,8 @@ private:
             
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
-            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_, pubFusionLaserCloud_);
+            if (fusion_pub_en)              publishFusionLaserCloud(pubFusionLaserCloud_);
+            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
 
             /*** Debug variables ***/
