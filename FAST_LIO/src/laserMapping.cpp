@@ -294,6 +294,24 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
+void reset_pos()
+{
+    state_point.pos(0) = 0.0;
+    state_point.pos(1) = 0.0;
+    state_point.pos(1) = 0.0;
+
+    state_point.rot.coeffs()[0] = 0.0;
+    state_point.rot.coeffs()[1] = 0.0;
+    state_point.rot.coeffs()[2] = 0.0;
+    state_point.rot.coeffs()[3] = 1.0;
+    geoQuat.x = 0.0;
+    geoQuat.y = 0.0;
+    geoQuat.z = 0.0;
+    geoQuat.w = 1.0;
+
+    kf.change_x(state_point);
+}
+
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     mtx_buffer.lock();
@@ -304,6 +322,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+        reset_pos();
     }
     if (is_first_lidar)
     {
@@ -345,6 +364,7 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         imu_buffer.clear();
+        reset_pos();
     }
 
     last_timestamp_imu = timestamp;
