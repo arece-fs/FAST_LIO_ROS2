@@ -1173,15 +1173,12 @@ private:
             geometry_msgs::msg::TransformStamped transform_stamped;
             try {
                 // Get the latest available transform
-                transform_stamped = tf_buffer_->lookupTransform(lidar_frame_id, "odom", tf2::TimePointZero);
+                transform_stamped = tf_buffer_->lookupTransform(lidar_frame_id, odom_frame_id, tf2::TimePointZero);
             } catch (tf2::TransformException &ex) { 
-                RCLCPP_INFO(this->get_logger(), "KO,");
                 RCLCPP_WARN(this->get_logger(), "%s", ex.what());
                 return;
             }
-            RCLCPP_INFO(this->get_logger(), "OK");
             tf2::doTransform(FusionlaserCloudmsg_world, FusionlaserCloudmsg_body, transform_stamped);
-            RCLCPP_INFO(this->get_logger(), "Publishing Fusion Laser Cloud...");
             FusionlaserCloudmsg_body.header.stamp = get_ros_time(lidar_end_time);
             FusionlaserCloudmsg_body.header.frame_id = lidar_frame_id;
             pubFusionLaserCloud->publish(FusionlaserCloudmsg_body);
