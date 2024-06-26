@@ -57,6 +57,10 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/create_timer_ros.h>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "preprocess.h"
@@ -102,7 +106,8 @@ bool    is_first_lidar = true;
 
 int FusionBufferSize = 3;
 
-string odom_frame_id, base_frame_id;
+string odom_frame_id, base_frame_id, lidar_frame_id;
+
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -459,28 +464,7 @@ PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_fusion_sum(new PointCloudXYZI());
 
-void publishFusionLaserCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubFusionLaserCloud ) {
-    
-    int size = feats_undistort->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld( \
-                        new PointCloudXYZI(size, 1));
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&feats_undistort->points[i], \
-                                &laserCloudWorld->points[i]);
-        }
-        
-        FusionLaserPointBuffer.insert(FusionLaserPointBuffer.begin() + FusionbufferIndex, laserCloudWorld);
-        for(int i = 0; i < FusionBufferSize; i++) *pcl_fusion_sum += *FusionLaserPointBuffer.at(i);
 
-        FusionbufferIndex = (FusionbufferIndex + 1) % FusionBufferSize;
-        sensor_msgs::msg::PointCloud2 FusionlaserCloudmsg;
-        pcl::toROSMsg(*pcl_fusion_sum, FusionlaserCloudmsg);
-        FusionlaserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        FusionlaserCloudmsg.header.frame_id = odom_frame_id;
-        pubFusionLaserCloud->publish(FusionlaserCloudmsg);
-        pcl_fusion_sum->clear();
-}
 
 
 
@@ -858,7 +842,8 @@ public:
         this->declare_parameter<string>("traj_save.traj_file_path", "");
 
         this->declare_parameter<string>("common.odom_frame_id", "odom");
-        this->declare_parameter<string>("common.base_frame_id", "velodyne");
+        this->declare_parameter<string>("common.base_frame_id", "base_link");
+        this->declare_parameter<string>("common.lidar_frame_id", "velodyne");
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
@@ -899,7 +884,9 @@ public:
         this->get_parameter_or<string>("traj_save.traj_file_path", traj_file_path, "");
 
         this->get_parameter_or<string>("common.odom_frame_id", odom_frame_id, "odom");
-        this->get_parameter_or<string>("common.base_frame_id", base_frame_id, "velodyne");
+        this->get_parameter_or<string>("common.base_frame_id", base_frame_id, "base_link");
+        this->get_parameter_or<string>("common.lidar_frame_id", lidar_frame_id, "velodyne");
+
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -948,6 +935,7 @@ public:
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubFusionLaserCloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_fusion", 20);
+        pubdeskewLaserCloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_deskew", 20);
 
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -955,6 +943,10 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 1000.0));  // 1ms
@@ -1098,6 +1090,8 @@ private:
             if (fusion_pub_en)              publishFusionLaserCloud(pubFusionLaserCloud_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
+            
+            publish_deskwed();
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1136,6 +1130,59 @@ private:
         publish_map(pubLaserCloudMap_);
     }
 
+    void publishFusionLaserCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubFusionLaserCloud) {
+
+        if(pubFusionLaserCloud->get_subscription_count() > 0) {
+            int size = feats_undistort->points.size();
+            PointCloudXYZI::Ptr laserCloudWorld( new PointCloudXYZI(size, 1));
+            for (int i = 0; i < size; i++)
+            {
+                RGBpointBodyToWorld(&feats_undistort->points[i], \
+                                    &laserCloudWorld->points[i]);
+            }
+            
+            FusionLaserPointBuffer.insert(FusionLaserPointBuffer.begin() + FusionbufferIndex, laserCloudWorld);
+            for(int i = 0; i < FusionBufferSize; i++) *pcl_fusion_sum += *FusionLaserPointBuffer.at(i);
+
+
+            FusionbufferIndex = (FusionbufferIndex + 1) % FusionBufferSize;
+
+            sensor_msgs::msg::PointCloud2 FusionlaserCloudmsg_world, FusionlaserCloudmsg_body;
+            pcl::toROSMsg(*pcl_fusion_sum, FusionlaserCloudmsg_world);
+
+            geometry_msgs::msg::TransformStamped transform_stamped;
+            try {
+                // Get the latest available transform
+                transform_stamped = tf_buffer_->lookupTransform(lidar_frame_id, "odom", tf2::TimePointZero);
+            } catch (tf2::TransformException &ex) { 
+                RCLCPP_INFO(this->get_logger(), "KO,");
+                RCLCPP_WARN(this->get_logger(), "%s", ex.what());
+                return;
+            }
+            RCLCPP_INFO(this->get_logger(), "OK");
+            tf2::doTransform(FusionlaserCloudmsg_world, FusionlaserCloudmsg_body, transform_stamped);
+            RCLCPP_INFO(this->get_logger(), "Publishing Fusion Laser Cloud...");
+            FusionlaserCloudmsg_body.header.stamp = get_ros_time(lidar_end_time);
+            FusionlaserCloudmsg_body.header.frame_id = lidar_frame_id;
+            pubFusionLaserCloud->publish(FusionlaserCloudmsg_body);
+            pcl_fusion_sum->clear();
+        }
+    }   
+
+    void publish_deskwed() {
+
+
+        if(pubdeskewLaserCloud_->get_subscription_count() > 0) {
+            sensor_msgs::msg::PointCloud2 deskewed_msg;
+            pcl::toROSMsg(*feats_undistort, deskewed_msg);
+            deskewed_msg.header.stamp = get_ros_time(lidar_end_time);
+            deskewed_msg.header.frame_id = lidar_frame_id;
+            pubdeskewLaserCloud_->publish(deskewed_msg);
+        }
+    }
+
+
+
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
@@ -1155,6 +1202,7 @@ private:
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubFusionLaserCloud_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubdeskewLaserCloud_;
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
@@ -1165,6 +1213,10 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
