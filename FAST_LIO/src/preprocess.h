@@ -151,7 +151,6 @@ class Preprocess
   double blind;
   bool feature_enabled, given_offset_time;
   // ros::Publisher pub_full, pub_surf, pub_corn;
-
 private:
   void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);

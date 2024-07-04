@@ -60,7 +60,7 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/create_timer_ros.h>
-#include <tf2_sensor_msgs/tf2_sensor_msgs.h>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "preprocess.h"
@@ -312,32 +312,7 @@ void reset_pos()
     kf.change_x(state_point);
 }
 
-void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
-{
-    mtx_buffer.lock();
-    scan_count ++;
-    double cur_time = get_time_sec(msg->header.stamp);
-    double preprocess_start_time = omp_get_wtime();
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
-    {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
-        reset_pos();
-    }
-    if (is_first_lidar)
-    {
-        is_first_lidar = false;
-    }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(cur_time);
-    last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
-}
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
@@ -951,8 +926,9 @@ public:
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
-        sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 20, standard_pcl_cbk);
+        sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 20, std::bind(&LaserMappingNode::standard_pcl_cbk, this, std::placeholders::_1));
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubFusionLaserCloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_fusion", 20);
         pubdeskewLaserCloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_deskew", 20);
@@ -1194,7 +1170,6 @@ private:
             pcl::toROSMsg(*feats_undistort, deskewed_msg);
             deskewed_msg.header.stamp = get_ros_time(lidar_end_time);
             deskewed_msg.header.frame_id = lidar_frame_id;
-            pubdeskewLaserCloud_->publish(deskewed_msg);
         }
     }
 
@@ -1215,6 +1190,42 @@ private:
             res->message = "Map save disabled.";
         }
     }
+
+    void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
+    {
+        mtx_buffer.lock();
+        scan_count ++;
+        double cur_time = get_time_sec(msg->header.stamp);
+        double preprocess_start_time = omp_get_wtime();
+        if (!is_first_lidar && cur_time < last_timestamp_lidar)
+        {
+            std::cerr << "lidar loop back, clear buffer" << std::endl;
+            lidar_buffer.clear();
+            reset_pos();
+        }
+        if (is_first_lidar)
+        {
+            is_first_lidar = false;
+        }
+
+        PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+        p_pre->process(msg, ptr);
+        if(pubdeskewLaserCloud_->get_subscription_count() > 0)
+        {
+            sensor_msgs::msg::PointCloud2 deskewed_msg;
+            pcl::toROSMsg(p_pre->pl_full, deskewed_msg);
+            deskewed_msg.header.stamp = get_ros_time(lidar_end_time);
+            deskewed_msg.header.frame_id = lidar_frame_id;
+            pubdeskewLaserCloud_->publish(deskewed_msg);
+        }
+        lidar_buffer.push_back(ptr);
+        time_buffer.push_back(cur_time);
+        last_timestamp_lidar = cur_time;
+        s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+        mtx_buffer.unlock();
+        sig_buffer.notify_all();
+    }
+
 
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;

@@ -258,6 +258,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
           pl_surf.points.push_back(added_pt);
         }
       }
+      pl_full.points.push_back(added_pt);    
     }
   }
 }
