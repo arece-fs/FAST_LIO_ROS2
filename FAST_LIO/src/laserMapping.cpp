@@ -44,6 +44,7 @@
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -57,6 +58,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2/convert.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/create_timer_ros.h>
@@ -65,6 +67,17 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <pcl/common/transforms.h>  
+#include <pcl/kdtree/kdtree_flann.h>
+
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <Eigen/Geometry>
+
+#include "std_msgs/msg/u_int32.hpp"
+
+#include <map>
+#include <unordered_map>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -89,7 +102,7 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic;
+string map_file_path, lid_topic, imu_topic, keyFrame_topic, keyFrame_id_topic;
 string traj_file_path;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -104,9 +117,19 @@ bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, fusion_pub_en = false;
 bool    is_first_lidar = true;
 
-int FusionBufferSize = 3;
+bool    recontructKdTree = false;
+bool    updateState = false;
+int     updateFrequency = 100;
+int KeyidCounter =  0;
 
-string odom_frame_id, base_frame_id, lidar_frame_id;
+// visualize
+bool visulize_map = false;
+
+
+int FusionBufferSize = 3;
+int LcFreqcount = 0;
+
+string odom_frame_id, base_frame_id, lidar_frame_id, keyframe_topic, keyframe_id_topic;
 
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -149,13 +172,28 @@ esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 vect3 pos_lid;
 
-nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
 geometry_msgs::msg::Quaternion geoQuat;
-geometry_msgs::msg::PoseStamped msg_body_pose;
+geometry_msgs::msg::PoseStamped msg_body_pose, msg_body_pose_updated;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+
+/*** Maintain keyframe mechanism ***/
+// cache historical lidar frames, and determine which frame is a key frame based on the subscribed sequence
+vector<PointCloudXYZI::Ptr> cloudKeyFrames;  // Store historical keyframe point clouds
+queue< pair<uint32_t, PointCloudXYZI::Ptr> > cloudBuff;      // Cache some historical lidar frames to extract key frame point clouds
+vector<uint32_t> idKeyFrames;           // keyframes id
+queue<uint32_t> idKeyFramesBuff;         // keyframes id buffer
+nav_msgs::msg::Path pathKeyFrames, path, path_updated;           // keyframes
+uint32_t data_seq;                    // data id 
+uint32_t lastKeyFramesId;               
+geometry_msgs::msg::Pose lastKeyFramesPose;  
+vector<geometry_msgs::msg::Pose> odoms;
+/*** save submap ***/
+pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtreeSurroundingKeyPoses(new pcl::KdTreeFLANN<pcl::PointXYZ>()); // kdtree of surrounding keyframe poses 
+pcl::VoxelGrid<pcl::PointXYZ> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
 
 void SigHandle(int sig)
 {
@@ -164,6 +202,16 @@ void SigHandle(int sig)
     sig_buffer.notify_all();
     rclcpp::shutdown();
 }
+
+/**
+ * distance between two points
+*/
+float pointDistance(pcl::PointXYZ p1, pcl::PointXYZ p2)
+{
+    return sqrt((p1.x-p2.x)*(p1.x-p2.x) + (p1.y-p2.y)*(p1.y-p2.y) + (p1.z-p2.z)*(p1.z-p2.z));
+}
+
+
 
 inline void dump_lio_state_to_log(FILE *fp)  
 {
@@ -351,6 +399,21 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
+
+
+void keyFrame_cbk(const nav_msgs::msg::Path::UniquePtr msg_keyframes){
+    pathKeyFrames = *msg_keyframes;
+
+}
+
+void keyFrameId_cbk(const std_msgs::msg::UInt32::UniquePtr msg_keyframe_id){
+    idKeyFramesBuff.push(msg_keyframe_id->data);
+}
+
+/*
+ * 获得同步的lidar和imu数据
+*/
+
 bool sync_packages(MeasureGroup &meas)
 {
     if (lidar_buffer.empty() || imu_buffer.empty()) {
@@ -537,6 +600,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     laserCloudmsg.header.frame_id = base_frame_id;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
+    cloudBuff.push( pair<int, PointCloudXYZI::Ptr>(data_seq ,laserCloudIMUBody) ); // Cache all point clouds sent to the backend
 }
 
 void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
@@ -600,6 +664,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.header.frame_id = odom_frame_id;
     odomAftMapped.child_frame_id = base_frame_id;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+    odomAftMapped.twist.covariance[0] = data_seq;
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
@@ -802,6 +867,8 @@ public:
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<string>("common.keyframe_topic", "/aft_pgo_path");
+        this->declare_parameter<string>("common.keyframe_id_topic", "/key_frames_ids");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -840,6 +907,14 @@ public:
         this->declare_parameter<string>("common.base_frame_id", "base_link");
         this->declare_parameter<string>("common.lidar_frame_id", "velodyne");
 
+        this->declare_parameter<bool>("common.recontructKdTree", true);
+        this->declare_parameter<bool>("common.updateState", false);
+        this->declare_parameter<int>("common.updateFrequency", 100); 
+
+        this->get_parameter_or<bool>("common.recontructKdTree", recontructKdTree, false);
+        this->get_parameter_or<bool>("common.updateState", updateState, false);
+        this->get_parameter_or<int>("common.updateFrequency", updateFrequency, 1000);
+
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.fusion_pub_en", fusion_pub_en, true);
@@ -847,6 +922,8 @@ public:
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
+        this->get_parameter_or<string>("common.keyframe_topic", keyframe_topic, "/aft_pgo_path");
+        this->get_parameter_or<string>("common.keyframe_id_topic", keyframe_id_topic, "/keyframe_id");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
@@ -897,6 +974,7 @@ public:
         memset(res_last, -1000.0f, sizeof(res_last));
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+        downSizeFilterSurroundingKeyPoses.setLeafSize(0.2,0.2,0.2);
         memset(point_selected_surf, true, sizeof(point_selected_surf));
         memset(res_last, -1000.0f, sizeof(res_last));
 
@@ -911,6 +989,8 @@ public:
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
+        data_seq = 0;
+        uint32_t LcFreqcount = 1;
         /*** debug record ***/
         // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
@@ -928,6 +1008,8 @@ public:
         /*** ROS subscribe initialization ***/
         sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 20, std::bind(&LaserMappingNode::standard_pcl_cbk, this, std::placeholders::_1));
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        sub_keyframes_ = this->create_subscription<nav_msgs::msg::Path>(keyframe_topic, 20, keyFrame_cbk);
+        sub_keyframes_id_ = this->create_subscription<std_msgs::msg::UInt32>(keyframe_id_topic, 20, keyFrameId_cbk);
 
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubFusionLaserCloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_fusion", 20);
@@ -938,6 +1020,9 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubPathUpdated_ = this->create_publisher<nav_msgs::msg::Path>("/path_updated", 20);
+        pubKeyFramesMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/keyframes_map", 20);
+
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -971,6 +1056,27 @@ private:
     //*** main functions ***//
     void timer_callback()
     {
+
+        //  Receive key frames and loop until one of them is empty (in theory, idKeyFramesBuff should be empty first)
+        while( !cloudBuff.empty() && !idKeyFramesBuff.empty() ){
+            while( idKeyFramesBuff.front() > cloudBuff.front().first )
+            {
+                cloudBuff.pop();
+            }
+            // 此时idKeyFramesBuff.front() == cloudBuff.front().first
+            assert(idKeyFramesBuff.front() == cloudBuff.front().first);
+            idKeyFrames.push_back(idKeyFramesBuff.front());
+            cloudKeyFrames.push_back( cloudBuff.front().second );
+            idKeyFramesBuff.pop();
+            cloudBuff.pop();
+        }
+        assert(pathKeyFrames.poses.size() <= cloudKeyFrames.size() );   //It is possible that the ID has been sent, but the node has not been updated yet.
+        // Record the latest keyframe information
+        if(pathKeyFrames.poses.size() >= 1){
+            lastKeyFramesId = idKeyFrames[pathKeyFrames.poses.size() - 1];
+            lastKeyFramesPose = pathKeyFrames.poses.back().pose;
+        }
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1002,6 +1108,166 @@ private:
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
+
+            if(LcFreqcount % updateFrequency == 0 ){
+                LcFreqcount = 1;
+                std::cout << "updateState: " << updateState << std::endl;
+                if(recontructKdTree && pathKeyFrames.poses.size() > 20){
+                    std::cout << "Reconstruct KdTree done " << std::endl;
+                    std::cout << "pathKeyFrames.poses.size(): " << pathKeyFrames.poses.size() << std::endl;
+                    /*** 所有关键帧的地图 ***/
+                    // PointCloudXYZI::Ptr keyFramesMap(new PointCloudXYZI());
+                    // PointCloudXYZI::Ptr keyframesTmp(new PointCloudXYZI());
+                    // Eigen::Isometry3d poseTmp;
+                    // assert(pathKeyFrames.poses.size() <= cloudKeyFrames.size() );   // 有可能id发过来了，但是节点还未更新
+                    // int keyFramesNum = pathKeyFrames.poses.size();
+                    // for(int i = 0; i < keyFramesNum; ++i){
+                    //     downSizeFilterMap.setInputCloud(cloudKeyFrames[i]);
+                    //     downSizeFilterMap.filter(*keyframesTmp);
+                    //     tf::poseMsgToEigen(pathKeyFrames.poses[i].pose,poseTmp);
+                    //     pcl::transformPointCloud(*keyframesTmp , *keyframesTmp, poseTmp.matrix());
+                    //     *keyFramesMap += *keyframesTmp;
+                    // }
+                    // downSizeFilterMap.setInputCloud(keyFramesMap);
+                    // downSizeFilterMap.filter(*keyFramesMap);
+
+                    // ikdtree.reconstruct(keyFramesMap->points);
+
+                    /*** A subgraph composed of close keyframes ***/
+                    pcl::PointCloud<pcl::PointXYZ>::Ptr cloudKeyPoses3D(new pcl::PointCloud<pcl::PointXYZ>());    // Historical keyframe pose (position)
+                    pcl::PointCloud<pcl::PointXYZ>::Ptr surroundingKeyPoses(new pcl::PointCloud<pcl::PointXYZ>());    
+                    pcl::PointCloud<pcl::PointXYZ>::Ptr surroundingKeyPosesDS(new pcl::PointCloud<pcl::PointXYZ>());    
+
+                    for(auto keyFramePose:pathKeyFrames.poses){
+                        cloudKeyPoses3D->points.emplace_back(keyFramePose.pose.position.x, 
+                                                                keyFramePose.pose.position.y, 
+                                                                keyFramePose.pose.position.z);
+                    }
+                    double surroundingKeyframeSearchRadius = 5;
+                    std::vector<int> pointSearchInd;
+                    std::vector<float> pointSearchSqDis;
+                    kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D); 
+                    kdtreeSurroundingKeyPoses->radiusSearch(cloudKeyPoses3D->back(), surroundingKeyframeSearchRadius, pointSearchInd, pointSearchSqDis);
+                    // go through the search results, pointSearchInd stores the index of the results under cloudKeyPoses3D
+                    unordered_map<float, int> keyFramePoseMap;  // Use the x coordinate of pose as the key of the hash table
+                    for (int i = 0; i < (int)pointSearchInd.size(); ++i)
+                    {
+                        int id = pointSearchInd[i];
+                        //Add to adjacent keyframe pose collection
+                        surroundingKeyPoses->push_back(cloudKeyPoses3D->points[id]);
+                        keyFramePoseMap[cloudKeyPoses3D->points[id].x] = id;
+                    }
+
+                    // Downsample
+                    downSizeFilterSurroundingKeyPoses.setInputCloud(surroundingKeyPoses);
+                    downSizeFilterSurroundingKeyPoses.filter(*surroundingKeyPosesDS);
+
+                    //Add offset frames close to the current keyframe. It is reasonable to add these frames.
+                    int numPoses = cloudKeyPoses3D->size();
+                    int offset = 10;
+                    for (int i = numPoses-1; i >= numPoses-1 - offset && i >= 0; --i)
+                    {
+                        surroundingKeyPosesDS->push_back(cloudKeyPoses3D->points[i]);
+                        keyFramePoseMap[cloudKeyPoses3D->points[i].x] = i;
+                    }
+
+                    //Add the points corresponding to the adjacent keyframe sets to the local map as a local point cloud map for scan-to-map matching
+                    // PointCloudXYZI::Ptr keyFramesSubmap = extractCloud(surroundingKeyPosesDS, keyFramePoseMap);
+
+                    PointCloudXYZI::Ptr keyFramesSubmap(new PointCloudXYZI());
+                   // Traverse the current frame (actually take the nearest key frame to find its adjacent key frame set) adjacent key frame set in the space-time dimension
+
+                    for (int i = 0; i < (int)surroundingKeyPosesDS->size(); ++i)
+                    {
+
+                        RCLCPP_INFO( this->get_logger(), "surroundingKeyPosesDS->points[i].x: %f", surroundingKeyPosesDS->points[i].x);
+                        RCLCPP_INFO( this->get_logger(), "surroundingKeyPosesDS->points[i].x: %ld", keyFramePoseMap.size());
+                        // assert(keyFramePoseMap.count(surroundingKeyPosesDS->points[i].x) != 0);
+                        if(keyFramePoseMap.count(surroundingKeyPosesDS->points[i].x) == 0)
+                            continue;
+
+                        if (pointDistance(surroundingKeyPosesDS->points[i], cloudKeyPoses3D->back()) > surroundingKeyframeSearchRadius)    // remove point to far 
+                            continue;
+                         RCLCPP_INFO( this->get_logger(), "key: %d", keyFramePoseMap.size());
+                        // adjacent keyframe index
+                        int thisKeyInd = keyFramePoseMap[ surroundingKeyPosesDS->points[i].x ];  // 以intensity作为红黑树的索引
+                       
+                        PointCloudXYZI::Ptr keyframesTmp(new PointCloudXYZI());
+                        Eigen::Isometry3d poseTmp;
+                        assert(pathKeyFrames.poses.size() <= cloudKeyFrames.size() );   // 有可能id发过来了，但是节点还未更新
+                        int keyFramesNum = pathKeyFrames.poses.size();
+                        RCLCPP_INFO( this->get_logger(), "keyFramesNum: %ld", pathKeyFrames.poses.size());
+
+                        downSizeFilterMap.setInputCloud(cloudKeyFrames[thisKeyInd]);
+
+                        downSizeFilterMap.filter(*keyframesTmp);
+                        
+                        tf2::fromMsg(pathKeyFrames.poses[thisKeyInd].pose,poseTmp);
+                        pcl::transformPointCloud(*keyframesTmp , *keyframesTmp, poseTmp.matrix());
+                        *keyFramesSubmap += *keyframesTmp;
+
+                    }
+                    downSizeFilterMap.setInputCloud(keyFramesSubmap);
+                    downSizeFilterMap.filter(*keyFramesSubmap);
+
+                    ikdtree.reconstruct(keyFramesSubmap->points);
+                }
+            }
+
+            // update status
+            if(updateState)
+            {
+                state_ikfom state_updated = kf.get_x();
+                Eigen::Isometry3d lastPose(state_updated.rot);
+                lastPose.pretranslate(state_updated.pos);
+
+
+                Eigen::Isometry3d lastKeyFramesPoseEigen;       // 最新的关键帧位姿
+                tf2::fromMsg(lastKeyFramesPose, lastKeyFramesPoseEigen);
+
+                Eigen::Isometry3d lastKeyFrameOdomPoseEigen;    // 最新的关键帧对应的odom的位姿
+                tf2::fromMsg(lastKeyFramesPose, lastKeyFrameOdomPoseEigen);
+
+                // lastPose表示世界坐标系到当前坐标系的变换，下面两个公式等价
+                // lastPose = (lastKeyFramesPoseEigen.inverse() * lastKeyFrameOdomPoseEigen* lastPose.inverse()).inverse();
+                lastPose = lastPose * lastKeyFrameOdomPoseEigen.inverse() * lastKeyFramesPoseEigen;
+
+                Eigen::Quaterniond lastPoseQuat( lastPose.rotation() );
+                Eigen::Vector3d lastPoseQuatPos( lastPose.translation() );
+                state_updated.rot = lastPoseQuat;
+                state_updated.pos = lastPoseQuatPos;
+                kf.change_x(state_updated);
+
+                esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P_updated = kf.get_P();  // 获取当前的状态估计的协方差矩阵
+                P_updated.setIdentity();
+                //QUESTION: 状态的协方差矩阵是否要更新为一个比较的小的值？ 
+                // init_P(0,0) = init_P(1,1) = init_P(2,2) = 0.00001; 
+                // init_P(3,3) = init_P(4,4) = init_P(5,5) = 0.00001;
+                P_updated(6,6) = P_updated(7,7) = P_updated(8,8) = 0.00001;
+                P_updated(9,9) = P_updated(10,10) = P_updated(11,11) = 0.00001;
+                P_updated(15,15) = P_updated(16,16) = P_updated(17,17) = 0.0001;
+                P_updated(18,18) = P_updated(19,19) = P_updated(20,20) = 0.001;
+                P_updated(21,21) = P_updated(22,22) = 0.00001; 
+                kf.change_P(P_updated);
+
+                msg_body_pose_updated.pose.position.x = state_updated.pos(0);
+                msg_body_pose_updated.pose.position.y = state_updated.pos(1);
+                msg_body_pose_updated.pose.position.z = state_updated.pos(2);
+                msg_body_pose_updated.pose.orientation.x = state_updated.rot.x();
+                msg_body_pose_updated.pose.orientation.y = state_updated.rot.y();
+                msg_body_pose_updated.pose.orientation.z = state_updated.rot.z();
+                msg_body_pose_updated.pose.orientation.w = state_updated.rot.w();
+                msg_body_pose_updated.header.stamp = this->get_clock()->now();
+                msg_body_pose_updated.header.frame_id = odom_frame_id;
+
+
+                path_updated.poses.push_back(msg_body_pose_updated);
+                path_updated.header.stamp = this->get_clock()->now();
+                path_updated.header.frame_id = odom_frame_id;
+                pubPathUpdated_->publish(path_updated);
+            }
+            LcFreqcount++;
+            
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
 
@@ -1086,6 +1352,7 @@ private:
             if (fusion_pub_en)              publishFusionLaserCloud(pubFusionLaserCloud_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
+            ++data_seq;
             
             publish_deskwed();
 
@@ -1232,13 +1499,19 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubFusionLaserCloud_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubdeskewLaserCloud_;
 
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubKeyFramesMap_;
+
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPathUpdated_;
+
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_keyframes_;
+    rclcpp::Subscription<std_msgs::msg::UInt32>::SharedPtr sub_keyframes_id_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
