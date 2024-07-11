@@ -204,7 +204,7 @@ void SigHandle(int sig)
 }
 
 /**
- * distance between two points
+ * distance between two pointswrite
 */
 float pointDistance(pcl::PointXYZ p1, pcl::PointXYZ p2)
 {
@@ -951,17 +951,17 @@ public:
         uint32_t LcFreqcount = 1;
         /*** debug record ***/
         // FILE *fp;
-        string pos_log_dir = root_dir + "/Log/pos_log.txt";
-        fp = fopen(pos_log_dir.c_str(),"w");
+        //string pos_log_dir = root_dir + "/Log/pos_log.txt";
+        //fp = fopen(pos_log_dir.c_str(),"w");
 
         // ofstream fout_pre, fout_out, fout_dbg;
-        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-        if (fout_pre && fout_out)
-            cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
-        else
-            cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+        // fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
+        // fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
+        // fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
+        // if (fout_pre && fout_out)
+        //     cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
+        // else
+        //     cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
         sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 20, std::bind(&LaserMappingNode::standard_pcl_cbk, this, std::placeholders::_1));
@@ -1005,9 +1005,9 @@ public:
 
     ~LaserMappingNode()
     {
-        fout_out.close();
-        fout_pre.close();
-        fclose(fp);
+        // fout_out.close();
+        // fout_pre.close();
+        // fclose(fp);
     }
 
 private:
@@ -1265,8 +1265,8 @@ private:
             feats_down_world->resize(feats_down_size);
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-            fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
-            <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
+            // fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
+            // <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
             if(0) // If you need to see map point, change to "if(1)"
             {
@@ -1337,11 +1337,11 @@ private:
                 s_plot9[time_log_counter] = aver_time_consu;
                 s_plot10[time_log_counter] = add_point_size;
                 time_log_counter ++;
-                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
+                if(debug_print) printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-                fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
-                <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
-                dump_lio_state_to_log(fp);
+                // fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
+                // <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
+                // dump_lio_state_to_log(fp);
             }
         }
     }
@@ -1485,8 +1485,8 @@ private:
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
 
-    FILE *fp;
-    ofstream fout_pre, fout_out, fout_dbg;
+    // FILE *fp;
+    // ofstream fout_pre, fout_out, fout_dbg;
 };
 
 int main(int argc, char** argv)
@@ -1501,7 +1501,7 @@ int main(int argc, char** argv)
 
     /**************** save trajectory ****************/
     if(traj_save_en){
-        save_trajectory(traj_file_path);
+        // save_trajectory(traj_file_path);
         if(debug_print) std::cout << "Save FAST-LIO2 trajectory !!" << std::endl;  
     }
 
