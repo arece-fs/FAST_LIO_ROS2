@@ -119,11 +119,10 @@ bool    is_first_lidar = true;
 
 bool    recontructKdTree = false;
 bool    updateState = false;
+bool    pub_odom_transform = false;
 int     updateFrequency = 100;
 int KeyidCounter =  0;
 
-// visualize
-bool visulize_map = false;
 
 
 int FusionBufferSize = 3;
@@ -144,6 +143,7 @@ deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 deque<PointCloudXYZI::Ptr> FusionLaserPointBuffer;
  
 int FusionbufferIndex = 0;
+bool debug_print;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -664,7 +664,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.header.frame_id = odom_frame_id;
     odomAftMapped.child_frame_id = base_frame_id;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    odomAftMapped.twist.covariance[0] = data_seq;
+    //odomAftMapped.twist.covariance[0] = data_seq;
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
@@ -678,18 +678,20 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    if(pub_odom_transform) {
+        geometry_msgs::msg::TransformStamped trans;
+        trans.header.frame_id = odom_frame_id ;
+        trans.child_frame_id = base_frame_id;
+        trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+        trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+        trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+        trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
+        trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
+        trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
+        trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+        tf_br->sendTransform(trans);
+    }
 
-    geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = odom_frame_id ;
-    trans.child_frame_id = base_frame_id;
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -859,108 +861,64 @@ class LaserMappingNode : public rclcpp::Node
 public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
-        this->declare_parameter<bool>("publish.path_en", true);
-        this->declare_parameter<bool>("publish.scan_publish_en", true);
-        this->declare_parameter<bool>("publish.dense_publish_en", true);
-        this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
-        this->declare_parameter<int>("max_iteration", 4);
-        this->declare_parameter<string>("map_file_path", "");
-        this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
-        this->declare_parameter<string>("common.imu_topic", "/livox/imu");
-        this->declare_parameter<string>("common.keyframe_topic", "/aft_pgo_path");
-        this->declare_parameter<string>("common.keyframe_id_topic", "/key_frames_ids");
-        this->declare_parameter<bool>("common.time_sync_en", false);
-        this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
-        this->declare_parameter<double>("filter_size_corner", 0.5);
-        this->declare_parameter<double>("filter_size_surf", 0.5);
-        this->declare_parameter<double>("filter_size_map", 0.5);
-        this->declare_parameter<double>("cube_side_length", 200.);
-        this->declare_parameter<float>("mapping.det_range", 300.);
-        this->declare_parameter<double>("mapping.fov_degree", 180.);
-        this->declare_parameter<double>("mapping.gyr_cov", 0.1);
-        this->declare_parameter<double>("mapping.acc_cov", 0.1);
-        this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
-        this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
-        this->declare_parameter<double>("preprocess.blind", 0.01);
-        this->declare_parameter<int>("preprocess.lidar_type", AVIA);
-        this->declare_parameter<int>("preprocess.scan_line", 16);
-        this->declare_parameter<int>("preprocess.timestamp_unit", US);
-        this->declare_parameter<int>("preprocess.scan_rate", 10);
-        this->declare_parameter<int>("point_filter_num", 2);
-        this->declare_parameter<bool>("feature_extract_enable", false);
-        this->declare_parameter<bool>("runtime_pos_log_enable", false);
-        this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+
+        odom_frame_id = this->declare_parameter<string>("lio.common.odom_frame_id", "odom");
+        base_frame_id = this->declare_parameter<string>("lio.common.base_frame_id", "base_link");
+        lidar_frame_id = this->declare_parameter<string>("lio.common.lidar_frame_id", "velodyne");
+        map_file_path = this->declare_parameter<string>("lio.common.map_file_path", "");
+        NUM_MAX_ITERATIONS = this->declare_parameter<int>("lio.common.max_iteration", 4);
+        lid_topic = this->declare_parameter<string>("lio.common.lid_topic", "/velodyne_points");
+        imu_topic = this->declare_parameter<string>("lio.common.imu_topic", "/zed_m/zed_mini/imu/data");
+        keyframe_topic = this->declare_parameter<string>("lio.common.keyframe_topic", "/aft_pgo_path");
+        keyframe_id_topic = this->declare_parameter<string>("lio.common.keyframe_id_topic", "/key_frames_ids");
+        time_sync_en = this->declare_parameter<bool>("lio.common.time_sync_en", false);
+        time_diff_lidar_to_imu = this->declare_parameter<double>("lio.common.time_offset_lidar_to_imu", 0.0);
+        runtime_pos_log = this->declare_parameter<bool>("lio.common.runtime_pos_log_enable", false);
+        filter_size_surf_min = this->declare_parameter<double>("lio.common.filter_size_surf", 0.5);
+        filter_size_map_min = this->declare_parameter<double>("lio.common.filter_size_map", 0.5);
+        cube_len = this->declare_parameter<double>("lio.common.cube_side_length", 1000.0);
+        debug_print = this->declare_parameter<bool>("lio.common.debug_print", false);
+        
+
+        p_pre->lidar_type = this->declare_parameter<int>("lio.preprocess.lidar_type", 2);
+        p_pre->N_SCANS = this->declare_parameter<int>("lio.preprocess.scan_line", 16);
+        p_pre->time_unit = this->declare_parameter<int>("lio.preprocess.timestamp_unit", 0);
+        p_pre->blind = this->declare_parameter<double>("lio.preprocess.blind", 2.0);
+        p_pre->SCAN_RATE = this->declare_parameter<int>("lio.preprocess.scan_rate", 10);
+        p_pre->point_filter_num = this->declare_parameter<int>("lio.preprocess.point_filter_num", 4);
+        p_pre->feature_enabled = this->declare_parameter<bool>("lio.preprocess.feature_extract_enable", false);
 
 
-        this->declare_parameter<bool>("fusionCloud.fusion_pub_en", false);
-        this->declare_parameter<const int>("fusionCloud.interval", 5);
+        path_en = this->declare_parameter<bool>("lio.publish.path_en", false);
+        scan_pub_en = this->declare_parameter<bool>("lio.publish.scan_publish_en", false);
+        dense_pub_en = this->declare_parameter<bool>("lio.publish.dense_publish_en", false);
+        scan_body_pub_en = this->declare_parameter<bool>("lio.publish.scan_bodyframe_pub_en", false);
+        fusion_pub_en = this->declare_parameter<bool>("lio.publish.fusion_pub_en", false);
+        pub_odom_transform = this->declare_parameter<bool>("lio.publish.pub_odom_transform", false);
+
+        recontructKdTree = this->declare_parameter<bool>("lio.loopClosure.recontructKdTree", true);
+        updateState = this->declare_parameter<bool>("lio.loopClosure.updateState", false);
+        updateFrequency = this->declare_parameter<int>("lio.loopClosure.updateFrequency", 100);
+
+        DET_RANGE = this->declare_parameter<float>("lio.mapping.det_range", 200.);
+        fov_deg = this->declare_parameter<double>("lio.mapping.fov_degree", 360.);
+        gyr_cov = this->declare_parameter<double>("lio.mapping.gyr_cov", 0.1);
+        acc_cov = this->declare_parameter<double>("lio.mapping.acc_cov", 0.1);
+        b_gyr_cov = this->declare_parameter<double>("lio.mapping.b_gyr_cov", 0.0001);
+        b_acc_cov = this->declare_parameter<double>("lio.mapping.b_acc_cov", 0.0001);
+        extrinsic_est_en = this->declare_parameter<bool>("lio.mapping.extrinsic_est_en", true);
+        extrinT = this->declare_parameter<vector<double>>("lio.mapping.extrinsic_T", vector<double>());
+        extrinR = this->declare_parameter<vector<double>>("lio.mapping.extrinsic_R", vector<double>());
 
 
-        this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
-        this->declare_parameter<int>("pcd_save.interval", -1);
-        this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
-        this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
-        this->declare_parameter<bool>("traj_save.traj_save_en", false);
-        this->declare_parameter<string>("traj_save.traj_file_path", "");
+        FusionBufferSize = this->declare_parameter<const int>("lio.fusionCloud.size", 5);
 
-        this->declare_parameter<string>("common.odom_frame_id", "odom");
-        this->declare_parameter<string>("common.base_frame_id", "base_link");
-        this->declare_parameter<string>("common.lidar_frame_id", "velodyne");
-
-        this->declare_parameter<bool>("common.recontructKdTree", true);
-        this->declare_parameter<bool>("common.updateState", false);
-        this->declare_parameter<int>("common.updateFrequency", 100); 
-
-        this->get_parameter_or<bool>("common.recontructKdTree", recontructKdTree, false);
-        this->get_parameter_or<bool>("common.updateState", updateState, false);
-        this->get_parameter_or<int>("common.updateFrequency", updateFrequency, 1000);
-
-        this->get_parameter_or<bool>("publish.path_en", path_en, true);
-        this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
-        this->get_parameter_or<bool>("publish.fusion_pub_en", fusion_pub_en, true);
-        this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
-        this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
-        this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
-        this->get_parameter_or<string>("map_file_path", map_file_path, "");
-        this->get_parameter_or<string>("common.keyframe_topic", keyframe_topic, "/aft_pgo_path");
-        this->get_parameter_or<string>("common.keyframe_id_topic", keyframe_id_topic, "/keyframe_id");
-        this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
-        this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
-        this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
-        this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
-        this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
-        this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
-        this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
-        this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
-        this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
-        this->get_parameter_or<double>("mapping.gyr_cov",gyr_cov,0.1);
-        this->get_parameter_or<double>("mapping.acc_cov",acc_cov,0.1);
-        this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
-        this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
-        this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
-        this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
-        this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
-        this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
-        this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
-        this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
-        this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
-        this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
-        this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
-        this->get_parameter_or<bool>("fusionCloud.fusion_pub_en",fusion_pub_en, false);
-        this->get_parameter_or<int>("fusionCloud.interval",FusionBufferSize, 5);
-        this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
-        this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
-        this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
-        this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-        this->get_parameter_or<bool>("traj_save.traj_save_en", traj_save_en, false);
-        this->get_parameter_or<string>("traj_save.traj_file_path", traj_file_path, "");
-
-        this->get_parameter_or<string>("common.odom_frame_id", odom_frame_id, "odom");
-        this->get_parameter_or<string>("common.base_frame_id", base_frame_id, "base_link");
-        this->get_parameter_or<string>("common.lidar_frame_id", lidar_frame_id, "velodyne");
-
-
-        RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        pcd_save_en = this->declare_parameter<bool>("lio.pcd_save.pcd_save_en", false);
+        pcd_save_interval = this->declare_parameter<int>("lio.pcd_save.interval", -1);
+        
+ 
+        traj_save_en = this->declare_parameter<bool>("lio.traj_save.traj_save_en", false);
+        traj_file_path = this->declare_parameter<string>("lio.traj_save.traj_file_path", "");
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id =odom_frame_id;
@@ -1042,7 +1000,7 @@ public:
         FusionLaserPointBuffer.resize(FusionBufferSize);
         for (int i = 0; i < FusionBufferSize; i++) FusionLaserPointBuffer[i].reset(new PointCloudXYZI());
 
-        RCLCPP_INFO(this->get_logger(), "Node init finished.");
+        if(debug_print) RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
     ~LaserMappingNode()
@@ -1111,10 +1069,10 @@ private:
 
             if(LcFreqcount % updateFrequency == 0 ){
                 LcFreqcount = 1;
-                std::cout << "updateState: " << updateState << std::endl;
+                if(debug_print) std::cout << "updateState: " << updateState << std::endl;
                 if(recontructKdTree && pathKeyFrames.poses.size() > 20){
-                    std::cout << "Reconstruct KdTree done " << std::endl;
-                    std::cout << "pathKeyFrames.poses.size(): " << pathKeyFrames.poses.size() << std::endl;
+                    if(debug_print) std::cout << "Reconstruct KdTree done " << std::endl;
+                    if(debug_print) std::cout << "pathKeyFrames.poses.size(): " << pathKeyFrames.poses.size() << std::endl;
                     /*** 所有关键帧的地图 ***/
                     // PointCloudXYZI::Ptr keyFramesMap(new PointCloudXYZI());
                     // PointCloudXYZI::Ptr keyframesTmp(new PointCloudXYZI());
@@ -1180,15 +1138,15 @@ private:
                     for (int i = 0; i < (int)surroundingKeyPosesDS->size(); ++i)
                     {
 
-                        RCLCPP_INFO( this->get_logger(), "surroundingKeyPosesDS->points[i].x: %f", surroundingKeyPosesDS->points[i].x);
-                        RCLCPP_INFO( this->get_logger(), "surroundingKeyPosesDS->points[i].x: %ld", keyFramePoseMap.size());
+                        if(debug_print) RCLCPP_INFO( this->get_logger(), "surroundingKeyPosesDS->points[i].x: %f", surroundingKeyPosesDS->points[i].x);
+                        if(debug_print) RCLCPP_INFO( this->get_logger(), "surroundingKeyPosesDS->points[i].x: %ld", keyFramePoseMap.size());
                         // assert(keyFramePoseMap.count(surroundingKeyPosesDS->points[i].x) != 0);
                         if(keyFramePoseMap.count(surroundingKeyPosesDS->points[i].x) == 0)
                             continue;
 
                         if (pointDistance(surroundingKeyPosesDS->points[i], cloudKeyPoses3D->back()) > surroundingKeyframeSearchRadius)    // remove point to far 
                             continue;
-                         RCLCPP_INFO( this->get_logger(), "key: %d", keyFramePoseMap.size());
+                        if(debug_print)  RCLCPP_INFO( this->get_logger(), "key: %ld", keyFramePoseMap.size());
                         // adjacent keyframe index
                         int thisKeyInd = keyFramePoseMap[ surroundingKeyPosesDS->points[i].x ];  // 以intensity作为红黑树的索引
                        
@@ -1196,7 +1154,7 @@ private:
                         Eigen::Isometry3d poseTmp;
                         assert(pathKeyFrames.poses.size() <= cloudKeyFrames.size() );   // 有可能id发过来了，但是节点还未更新
                         int keyFramesNum = pathKeyFrames.poses.size();
-                        RCLCPP_INFO( this->get_logger(), "keyFramesNum: %ld", pathKeyFrames.poses.size());
+                        if(debug_print) RCLCPP_INFO( this->get_logger(), "keyFramesNum: %ld", pathKeyFrames.poses.size());
 
                         downSizeFilterMap.setInputCloud(cloudKeyFrames[thisKeyInd]);
 
@@ -1279,7 +1237,7 @@ private:
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
-                RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
+                if(debug_print) RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
                 {
                     ikdtree.set_downsample_param(filter_size_map_min);
@@ -1544,7 +1502,7 @@ int main(int argc, char** argv)
     /**************** save trajectory ****************/
     if(traj_save_en){
         save_trajectory(traj_file_path);
-        std::cout << "Save FAST-LIO2 trajectory !!" << std::endl;  
+        if(debug_print) std::cout << "Save FAST-LIO2 trajectory !!" << std::endl;  
     }
 
     /**************** save map ****************/
