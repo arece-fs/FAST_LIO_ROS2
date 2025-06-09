@@ -63,6 +63,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_eigen REQUIRED)
+find_package(tf2_sensor_msgs REQUIRED)
 
 set(dependencies
   rclcpp
@@ -70,6 +71,7 @@ set(dependencies
   rclcpp_components
   geometry_msgs
   tf2_geometry_msgs
+  tf2_sensor_msgs
   nav_msgs
   sensor_msgs
   std_msgs
